@@ -17,13 +17,19 @@ if (Test-Path -LiteralPath $config.StatusPath) {
 $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 $taskState = if ($task) { [string]$task.State } else { "Missing" }
 
-$processes = Get-CimInstance Win32_Process |
-    Where-Object { $_.Name -in @("powershell.exe", "pwsh.exe") } |
-    Where-Object { $_.CommandLine -match [regex]::Escape("watch-port.ps1") }
+$powerShellProcesses = @(Get-CimInstance Win32_Process |
+    Where-Object { $_.Name -in @("powershell.exe", "pwsh.exe") })
+$processes = @($powerShellProcesses |
+    Where-Object { $_.CommandLine -match [regex]::Escape("watch-port.ps1") })
 
 $watcherProcess = $null
 if ($status -and $status.watcherPid) {
-    $watcherProcess = $processes | Where-Object { $_.ProcessId -eq [int]$status.watcherPid } | Select-Object -First 1
+    # The watcher runs elevated, so a non-elevated shell cannot read its CommandLine (it is null).
+    # In that case trust the PID the watcher recorded, as long as it is still a PowerShell process.
+    $watcherProcess = $powerShellProcesses | Where-Object {
+        $_.ProcessId -eq [int]$status.watcherPid -and
+        (-not $_.CommandLine -or $_.CommandLine -match [regex]::Escape("watch-port.ps1"))
+    } | Select-Object -First 1
 }
 if (-not $watcherProcess) {
     $watcherProcess = $processes | Select-Object -First 1

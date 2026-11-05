@@ -8,9 +8,11 @@ try {
     # Elevate before collecting credentials. Do not put credentials in command arguments.
     if (-not (Test-IsElevated)) {
         $originalUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-        # A filtered administrator token still includes the Administrators group SID.
+        # A UAC-filtered administrator token still carries the Administrators SID, but marked
+        # deny-only. WindowsIdentity.Groups omits deny-only groups; Claims includes them.
         $adminGroup = 'S-1-5-32-544'
-        if ($adminGroup -notin @([System.Security.Principal.WindowsIdentity]::GetCurrent().Groups.Value)) {
+        $adminClaims = @([System.Security.Principal.WindowsIdentity]::GetCurrent().Claims | Where-Object { $_.Value -eq $adminGroup })
+        if ($adminClaims.Count -eq 0) {
             throw 'Run setup while signed in to the Windows administrator account that runs Proton VPN and qBittorrent. Do not elevate using a different user account.'
         }
         Write-Host "Requesting administrator access for $originalUser..."
