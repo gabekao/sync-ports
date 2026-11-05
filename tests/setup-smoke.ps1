@@ -93,6 +93,8 @@ try {
     }
     $env:SYNC_STATUS_PATH = Join-Path $testRoot 'status.json'
     $env:SYNC_LOG_PATH = Join-Path $testRoot 'watch.log'
+    # setup.ps1 only calls exit on failure, so reset the exit code before each run.
+    $global:LASTEXITCODE = 0
     & (Join-Path $testRoot 'setup.ps1')
     if ($FailLogin) {
         if ($LASTEXITCODE -ne 1 -or $global:SyncPortsTestregistered -or $global:SyncPortsTeststopped -ne 0) {
@@ -101,6 +103,7 @@ try {
         Write-Host 'PASS: failed login blocks task registration/start.'
         exit 0
     }
+    if ($LASTEXITCODE -ne 0) { throw "Fresh setup reported failure (exit $LASTEXITCODE)." }
     if (-not $global:SyncPortsTestregistered -or $global:SyncPortsTestprompts -ne 3) { throw 'New installation failed.' }
     $configFile = Join-Path $testRoot '.env'
     $before = (Get-FileHash -LiteralPath $configFile).Hash
@@ -108,7 +111,9 @@ try {
     if (-not $acl.AreAccessRulesProtected -or @($acl.Access | Where-Object IsInherited).Count) {
         throw 'New credentials file has inherited permissions.'
     }
+    $global:LASTEXITCODE = 0
     & (Join-Path $testRoot 'setup.ps1')
+    if ($LASTEXITCODE -ne 0) { throw "Repeat setup reported failure (exit $LASTEXITCODE)." }
     if ((Get-FileHash -LiteralPath $configFile).Hash -ne $before -or $global:SyncPortsTestprompts -ne 3 -or $global:SyncPortsTeststopped -ne 1) {
         throw 'Reinstall did not preserve configuration and restart the previous task.'
     }

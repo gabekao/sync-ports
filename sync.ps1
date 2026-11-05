@@ -8,6 +8,7 @@ $ErrorActionPreference = "Stop"
 
 . "$PSScriptRoot\sync-common.ps1"
 
+$config = $null
 try {
     $config = Get-SyncConfig -ScriptRoot $PSScriptRoot
     Write-SyncLog -LogPath $config.LogPath -Message "Running one-shot sync."
@@ -33,6 +34,8 @@ try {
     Write-SyncLog -LogPath $config.LogPath -Message "Applied listen_port=$port to qBittorrent."
 }
 catch {
-    Write-SyncLog -LogPath $config.LogPath -Level "ERROR" -Message $_.Exception.Message
+    # $config is null when loading configuration was what failed; still report the real error.
+    $logPath = if ($config) { $config.LogPath } else { $null }
+    Write-SyncLog -LogPath $logPath -Level "ERROR" -Message $_.Exception.Message
     exit 1
 }

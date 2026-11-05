@@ -173,6 +173,26 @@ function Write-SyncStatus {
     $Status | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $StatusPath
 }
 
+function ConvertTo-SyncTimestamp {
+    # PowerShell 7's ConvertFrom-Json turns ISO 8601 strings into [datetime]; passing that to
+    # [datetimeoffset]::Parse() round-trips through a culture string and drops sub-second precision.
+    param(
+        [AllowNull()]
+        $Value
+    )
+
+    if ($null -eq $Value) {
+        return $null
+    }
+    if ($Value -is [datetimeoffset]) {
+        return $Value
+    }
+    if ($Value -is [datetime]) {
+        return [datetimeoffset]$Value
+    }
+    return [datetimeoffset]::Parse("$Value", [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
 function Test-IsNumericPort {
     param(
         [AllowNull()]

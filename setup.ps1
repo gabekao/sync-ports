@@ -114,8 +114,8 @@ try {
         Start-Sleep -Seconds 1
         try {
             $status = Get-Content -LiteralPath $config.StatusPath -Raw -ErrorAction Stop | ConvertFrom-Json
-            if ($status.state -ne 'terminated' -and [datetimeoffset]::Parse($status.watcherStartedAt) -ge $startedAt -and
-                [datetimeoffset]::Parse($status.lastHeartbeatAt) -ge $startedAt) {
+            if ($status.state -ne 'terminated' -and (ConvertTo-SyncTimestamp $status.watcherStartedAt) -ge $startedAt -and
+                (ConvertTo-SyncTimestamp $status.lastHeartbeatAt) -ge $startedAt) {
                 $watcher = Get-CimInstance Win32_Process -Filter "ProcessId = $([int]$status.watcherPid)"
                 $scriptPath = Join-Path $PSScriptRoot 'watch-port.ps1'
                 if ($watcher -and $watcher.CommandLine -and $watcher.CommandLine.IndexOf($scriptPath, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and

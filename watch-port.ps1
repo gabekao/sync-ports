@@ -22,6 +22,7 @@ $script:StalePortSinceAt = $null
 $script:LastReconnectAt = $null
 $script:ReconnectCount = 0
 $script:LastLoggedQbtError = $null
+$script:LastLoggedLoopError = $null
 
 function Update-WatcherStatus {
     param(
@@ -212,59 +213,78 @@ try {
     $lastHeartbeatAt = (Get-Date).AddSeconds(-$script:Config.HeartbeatIntervalSeconds)
 
     while ($true) {
-        $script:LastPortStatus = Get-ProtonForwardPortStatus `
-            -LogPath $script:Config.ProtonVpnLogPath `
-            -StaleSeconds $script:Config.ProtonPortStaleSeconds
+        # A transient failure in one poll (Proton rotating its log mid-read, a locked status file,
+        # etc.) must not end the watcher: Task Scheduler does not restart a task whose script exits
+        # with an error, so it would stay down until the next logon. Log it and retry next poll.
+        try {
+            $script:LastPortStatus = Get-ProtonForwardPortStatus `
+                -LogPath $script:Config.ProtonVpnLogPath `
+                -StaleSeconds $script:Config.ProtonPortStaleSeconds
 
-        if ($script:LastPortStatus.State -eq "active") {
-            $script:StalePortSinceAt = $null
-            $port = $script:LastPortStatus.Port
-            if ($script:PendingPort -ne $port -and $script:LastAppliedPort -ne $port) {
-                Invoke-ApplyPort -Port $port
-                if ($script:PendingPort) {
-                    $lastRetryAt = Get-Date
-                }
-            }
-        }
-        else {
-            # Only treat a stale port as a death signal once we've actually applied a port before;
-            # missing-log / no-port at startup is the normal "waiting" state, not a failure.
-            if ($script:LastPortStatus.State -eq "stale-port" -and $script:LastAppliedPort) {
-                if (-not $script:StalePortSinceAt) {
-                    $script:StalePortSinceAt = Get-Date
+            if ($script:LastPortStatus.State -eq "active") {
+                $script:StalePortSinceAt = $null
+                $port = $script:LastPortStatus.Port
+                if ($script:PendingPort -ne $port -and $script:LastAppliedPort -ne $port) {
+                    Invoke-ApplyPort -Port $port
+                    if ($script:PendingPort) {
+                        $lastRetryAt = Get-Date
+                    }
                 }
             }
             else {
-                $script:StalePortSinceAt = $null
-            }
+                # Only treat a stale port as a death signal once we've actually applied a port before;
+                # missing-log / no-port at startup is the normal "waiting" state, not a failure.
+                if ($script:LastPortStatus.State -eq "stale-port" -and $script:LastAppliedPort) {
+                    if (-not $script:StalePortSinceAt) {
+                        $script:StalePortSinceAt = Get-Date
+                    }
+                }
+                else {
+                    $script:StalePortSinceAt = $null
+                }
 
-            if ($script:LastLoggedPortMessage -ne $script:LastPortStatus.Message) {
-                Write-SyncLog -LogPath $script:Config.LogPath -Level "INFO" -Message $script:LastPortStatus.Message
-                $script:LastLoggedPortMessage = $script:LastPortStatus.Message
-            }
-        }
-
-        if ($script:PendingPort -and ((Get-Date) - $lastRetryAt).TotalSeconds -ge $QbtRetryDelaySeconds) {
-            Invoke-ApplyPort -Port $script:PendingPort
-            $lastRetryAt = Get-Date
-        }
-
-        Update-QbtLiveness
-
-        if ($script:Config.AutoReconnect) {
-            $reason = Get-ReconnectReason
-            if ($reason) {
-                $cooldownElapsed = (-not $script:LastReconnectAt) -or (((Get-Date) - $script:LastReconnectAt).TotalSeconds -ge $script:Config.ReconnectCooldownSeconds)
-                if ($cooldownElapsed) {
-                    Invoke-Reconnect -Reason $reason
+                if ($script:LastLoggedPortMessage -ne $script:LastPortStatus.Message) {
+                    Write-SyncLog -LogPath $script:Config.LogPath -Level "INFO" -Message $script:LastPortStatus.Message
+                    $script:LastLoggedPortMessage = $script:LastPortStatus.Message
                 }
             }
-        }
 
-        if (((Get-Date) - $lastHeartbeatAt).TotalSeconds -ge $script:Config.HeartbeatIntervalSeconds) {
-            $heartbeatState = if ($script:PendingPort) { "degraded" } elseif ($script:LastPortStatus.State -eq "active") { "running" } else { "waiting-for-proton-port" }
-            Update-WatcherStatus -State $heartbeatState -HeartbeatOnly
-            $lastHeartbeatAt = Get-Date
+            if ($script:PendingPort -and ((Get-Date) - $lastRetryAt).TotalSeconds -ge $QbtRetryDelaySeconds) {
+                Invoke-ApplyPort -Port $script:PendingPort
+                $lastRetryAt = Get-Date
+            }
+
+            Update-QbtLiveness
+
+            if ($script:Config.AutoReconnect) {
+                $reason = Get-ReconnectReason
+                if ($reason) {
+                    $cooldownElapsed = (-not $script:LastReconnectAt) -or (((Get-Date) - $script:LastReconnectAt).TotalSeconds -ge $script:Config.ReconnectCooldownSeconds)
+                    if ($cooldownElapsed) {
+                        Invoke-Reconnect -Reason $reason
+                    }
+                }
+            }
+
+            if (((Get-Date) - $lastHeartbeatAt).TotalSeconds -ge $script:Config.HeartbeatIntervalSeconds) {
+                $heartbeatState = if ($script:PendingPort) { "degraded" } elseif ($script:LastPortStatus.State -eq "active") { "running" } else { "waiting-for-proton-port" }
+                Update-WatcherStatus -State $heartbeatState -HeartbeatOnly
+                $lastHeartbeatAt = Get-Date
+            }
+
+            $script:LastLoggedLoopError = $null
+        }
+        catch {
+            $loopError = $_.Exception.Message
+            if ($script:LastLoggedLoopError -ne $loopError) {
+                try {
+                    Write-SyncLog -LogPath $script:Config.LogPath -Level "WARN" -Message "Poll failed; retrying next interval: $loopError"
+                }
+                catch {
+                    # Logging itself failed (for example, the log file is locked); keep polling.
+                }
+                $script:LastLoggedLoopError = $loopError
+            }
         }
 
         Start-Sleep -Seconds $script:Config.PollIntervalSeconds

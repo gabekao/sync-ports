@@ -32,8 +32,8 @@ if (-not $watcherProcess) {
 $heartbeatAgeSeconds = $null
 $heartbeatFresh = $false
 if ($status -and $status.lastHeartbeatAt) {
-    $heartbeatAt = [datetimeoffset]::Parse($status.lastHeartbeatAt)
-    $heartbeatAgeSeconds = [math]::Round(((Get-Date) - $heartbeatAt.LocalDateTime).TotalSeconds, 1)
+    $heartbeatAt = ConvertTo-SyncTimestamp $status.lastHeartbeatAt
+    $heartbeatAgeSeconds = [math]::Round(([datetimeoffset]::Now - $heartbeatAt).TotalSeconds, 1)
     $heartbeatFresh = $heartbeatAgeSeconds -le ($config.HeartbeatIntervalSeconds + 30)
 }
 
