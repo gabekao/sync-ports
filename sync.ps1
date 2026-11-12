@@ -24,14 +24,13 @@ try {
         throw $status.Message
     }
 
-    Set-QbtListenPort `
-        -QbtUrl $config.QbtUrl `
-        -QbtUser $config.QbtUser `
-        -QbtPass $config.QbtPass `
-        -Port ([int]$port) `
-        -DisableUpnp $config.QbtDisableUpnp
+    $session = Connect-Qbt -QbtUrl $config.QbtUrl -QbtUser $config.QbtUser -QbtPass $config.QbtPass
+    $result = Invoke-QbtPortBind -Config $config -Session $session -Port ([int]$port) -Reason "one-shot sync" -SkipIfListening
+    if (-not $result.Success) {
+        throw "qBittorrent is '$($result.ConnectionStatus)' on listen_port=$port."
+    }
 
-    Write-SyncLog -LogPath $config.LogPath -Message "Applied listen_port=$port to qBittorrent."
+    Write-SyncLog -LogPath $config.LogPath -Message "Applied listen_port=$port to qBittorrent (connection_status=$($result.ConnectionStatus))."
 }
 catch {
     # $config is null when loading configuration was what failed; still report the real error.

@@ -134,6 +134,7 @@ try {
     Write-Host "Setup complete. Watcher is running; state=$($status.state)."
     Write-Host 'Port synchronization begins when Proton VPN reports a forwarded port.'
     Write-Host "Automatic Proton VPN recovery: $($config.AutoReconnect)."
+    Write-Host "Release WSL/Docker port reservations by restarting winnat: $($config.WinnatAutoRestart)."
 }
 catch {
     Write-Host "Setup failed: $($_.Exception.Message)" -ForegroundColor Red

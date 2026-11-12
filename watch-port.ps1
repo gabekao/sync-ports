@@ -7,22 +7,47 @@ $ErrorActionPreference = "Stop"
 
 . "$PSScriptRoot\sync-common.ps1"
 
+$script:LogEventSource = "SyncPorts.ProtonLog"
+
 $script:Config = $null
 $script:LastAppliedPort = $null
 $script:PendingPort = $null
+$script:LastRetryAt = $null
 $script:WatcherStartedAt = $null
 $script:LastPortStatus = $null
 $script:LastLoggedPortMessage = $null
+$script:ProtonLogWatcher = $null
+$script:LastLogWatchMessage = $null
 
 $script:QbtSession = $null
+$script:NextLivenessAt = $null
 $script:ConnectionStatus = $null
 $script:ActiveTorrents = $null
 $script:FirewalledSinceAt = $null
+$script:DisconnectedSinceAt = $null
 $script:StalePortSinceAt = $null
 $script:LastReconnectAt = $null
 $script:ReconnectCount = 0
 $script:LastLoggedQbtError = $null
 $script:LastLoggedLoopError = $null
+
+$script:BindAddress = $null
+$script:LastPortReservation = $null
+$script:BindRepairCount = 0
+$script:LastBindRepairAt = $null
+$script:WinnatRestartCount = 0
+$script:LastWinnatRestartAt = $null
+$script:BindFailedPort = $null
+$script:BindFailedAt = $null
+$script:LastSkippedRepairMessage = $null
+
+function Format-StatusTime {
+    param($Time)
+    if ($Time) {
+        return $Time.ToString("o")
+    }
+    return $null
+}
 
 function Update-WatcherStatus {
     param(
@@ -33,7 +58,7 @@ function Update-WatcherStatus {
     $status = @{
         state = $State
         watcherPid = $PID
-        watcherStartedAt = $(if ($script:WatcherStartedAt) { $script:WatcherStartedAt.ToString("o") } else { $null })
+        watcherStartedAt = Format-StatusTime $script:WatcherStartedAt
         updatedAt = (Get-Date).ToString("o")
         lastHeartbeatAt = (Get-Date).ToString("o")
         lastAppliedPort = $script:LastAppliedPort
@@ -41,10 +66,18 @@ function Update-WatcherStatus {
         protonPortState = $(if ($script:LastPortStatus) { $script:LastPortStatus.State } else { $null })
         protonPortAgeSeconds = $(if ($script:LastPortStatus) { $script:LastPortStatus.AgeSeconds } else { $null })
         protonPortTimestamp = $(if ($script:LastPortStatus) { $script:LastPortStatus.LineTimestamp } else { $null })
+        logWatchMode = $(if ($script:ProtonLogWatcher) { "events" } else { "polling" })
         connectionStatus = $script:ConnectionStatus
         activeTorrents = $script:ActiveTorrents
+        bindAddress = $script:BindAddress
+        lastPortReservation = $script:LastPortReservation
+        bindFailedPort = $script:BindFailedPort
+        bindRepairCount = $script:BindRepairCount
+        lastBindRepairAt = Format-StatusTime $script:LastBindRepairAt
+        winnatRestartCount = $script:WinnatRestartCount
+        lastWinnatRestartAt = Format-StatusTime $script:LastWinnatRestartAt
         reconnectCount = $script:ReconnectCount
-        lastReconnectAt = $(if ($script:LastReconnectAt) { $script:LastReconnectAt.ToString("o") } else { $null })
+        lastReconnectAt = Format-StatusTime $script:LastReconnectAt
         protonVpnLogPath = $script:Config.ProtonVpnLogPath
         logPath = $script:Config.LogPath
     }
@@ -66,6 +99,58 @@ function Update-WatcherStatus {
     }
 }
 
+function Write-SyncLogOnce {
+    # Logs a message only when it differs from the last one stored in the named script variable.
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Key,
+        [Parameter(Mandatory = $true)]
+        [string]$Message,
+        [string]$Level = "INFO"
+    )
+
+    if ((Get-Variable -Name $Key -Scope Script -ValueOnly) -ne $Message) {
+        Write-SyncLog -LogPath $script:Config.LogPath -Level $Level -Message $Message
+        Set-Variable -Name $Key -Scope Script -Value $Message
+    }
+}
+
+function Request-LivenessCheck {
+    param(
+        [int]$InSeconds = 0
+    )
+
+    $at = (Get-Date).AddSeconds($InSeconds)
+    if (-not $script:NextLivenessAt -or $at -lt $script:NextLivenessAt) {
+        $script:NextLivenessAt = $at
+    }
+}
+
+function Start-ProtonLogWatcher {
+    $logPath = $script:Config.ProtonVpnLogPath
+    $pollSeconds = $script:Config.PollIntervalSeconds
+    try {
+        $script:ProtonLogWatcher = Start-FileChangeWatcher -Path $logPath -SourceIdentifier $script:LogEventSource
+    }
+    catch {
+        $script:ProtonLogWatcher = $null
+        Write-SyncLogOnce -Key "LastLogWatchMessage" -Level "WARN" -Message "Cannot watch the Proton VPN log for changes ($($_.Exception.Message)); re-reading it every ${pollSeconds}s instead."
+        return
+    }
+
+    if ($script:ProtonLogWatcher) {
+        Write-SyncLogOnce -Key "LastLogWatchMessage" -Message "Watching '$logPath' for changes; also re-reading it every ${pollSeconds}s."
+    }
+    else {
+        Write-SyncLogOnce -Key "LastLogWatchMessage" -Message "Proton VPN log folder for '$logPath' does not exist yet; re-reading every ${pollSeconds}s until it appears."
+    }
+}
+
+function Stop-ProtonLogWatcher {
+    Stop-FileChangeWatcher -Watcher $script:ProtonLogWatcher -SourceIdentifier $script:LogEventSource
+    $script:ProtonLogWatcher = $null
+}
+
 function Get-QbtSession {
     if ($script:QbtSession) {
         return $script:QbtSession
@@ -77,6 +162,9 @@ function Get-QbtSession {
             -QbtUser $script:Config.QbtUser `
             -QbtPass $script:Config.QbtPass
         $script:LastLoggedQbtError = $null
+        # A new session usually means qBittorrent (re)started, and a restart can fail to bind a reserved
+        # port again. Check its listener soon instead of waiting for the next poll.
+        Request-LivenessCheck -InSeconds 3
         return $script:QbtSession
     }
     catch {
@@ -86,6 +174,42 @@ function Get-QbtSession {
         }
         return $null
     }
+}
+
+function Invoke-BindPort {
+    # Runs the detect/release/bind/verify cycle and records the outcome for status reporting.
+    param(
+        [Parameter(Mandatory = $true)]
+        $Session,
+        [Parameter(Mandatory = $true)]
+        [int]$Port,
+        [Parameter(Mandatory = $true)]
+        [string]$Reason,
+        $Preferences
+    )
+
+    $result = Invoke-QbtPortBind -Config $script:Config -Session $Session -Port $Port -Reason $Reason -Preferences $Preferences
+
+    $script:BindAddress = $result.BindAddress
+    $script:ConnectionStatus = $result.ConnectionStatus
+    if ($result.WinnatRestarts -gt 0) {
+        $script:WinnatRestartCount += $result.WinnatRestarts
+        $script:LastWinnatRestartAt = Get-Date
+    }
+    if ($result.Collision -and $result.Collision.Blocked) {
+        $script:LastPortReservation = "port ${Port}: $($result.Collision.Reasons -join '; ')"
+    }
+
+    if ($result.Success) {
+        $script:BindFailedPort = $null
+        $script:BindFailedAt = $null
+        $script:DisconnectedSinceAt = $null
+    }
+    else {
+        $script:BindFailedPort = "$Port"
+        $script:BindFailedAt = Get-Date
+    }
+    return $result
 }
 
 function Invoke-ApplyPort {
@@ -107,16 +231,26 @@ function Invoke-ApplyPort {
     }
 
     try {
-        Set-QbtListenPort `
-            -QbtUrl $script:Config.QbtUrl `
-            -Port ([int]$Port) `
-            -DisableUpnp $script:Config.QbtDisableUpnp `
-            -Session $session
+        $prefs = Get-QbtPreferences -QbtUrl $script:Config.QbtUrl -Session $session
+        if ([int]$prefs.listen_port -eq [int]$Port) {
+            # Already set, e.g. after a watcher restart. Leave the listener alone; the liveness check repairs
+            # it if qBittorrent is not actually listening.
+            if ($script:Config.QbtDisableUpnp -and ($prefs.PSObject.Properties.Name -contains "upnp") -and $prefs.upnp) {
+                Send-QbtPreferences -QbtUrl $script:Config.QbtUrl -Session $session -Preferences @{ upnp = $false }
+            }
+            $script:LastAppliedPort = $Port
+            $script:PendingPort = $null
+            Write-SyncLog -LogPath $script:Config.LogPath -Message "qBittorrent already uses listen_port=$Port."
+            Request-LivenessCheck
+            Update-WatcherStatus -State "running" -HeartbeatOnly
+            return
+        }
 
+        $result = Invoke-BindPort -Session $session -Port ([int]$Port) -Reason "Proton forwarded port changed" -Preferences $prefs
         $script:LastAppliedPort = $Port
         $script:PendingPort = $null
         Write-SyncLog -LogPath $script:Config.LogPath -Message "Applied listen_port=$Port to qBittorrent."
-        Update-WatcherStatus -State "running" -HeartbeatOnly
+        Update-WatcherStatus -State $(if ($result.Success) { "running" } else { "port-blocked" }) -HeartbeatOnly
     }
     catch {
         $script:PendingPort = $Port
@@ -126,10 +260,80 @@ function Invoke-ApplyPort {
     }
 }
 
+function Invoke-BindRepair {
+    # qBittorrent has no listener on the port it was given. The usual cause is a Windows port reservation
+    # that made its bind fail, at a port change or when qBittorrent restarted.
+    $port = $script:LastAppliedPort
+    $skip = $null
+    if (-not $script:LastPortStatus -or $script:LastPortStatus.State -ne "active" -or $script:LastPortStatus.Port -ne $port) {
+        $skip = "qBittorrent is disconnected, but Proton has no active forwarded port matching $port; waiting for Proton before rebinding."
+    }
+    elseif ($script:BindFailedPort -eq $port -and $script:BindFailedAt -and
+        ((Get-Date) - $script:BindFailedAt).TotalSeconds -lt $script:Config.BindRetryCooldownSeconds) {
+        $skip = "qBittorrent is still disconnected on port $port; retrying after the $($script:Config.BindRetryCooldownSeconds)s cooldown."
+    }
+    if ($skip) {
+        Write-SyncLogOnce -Key "LastSkippedRepairMessage" -Message $skip
+        return
+    }
+    $script:LastSkippedRepairMessage = $null
+
+    $session = Get-QbtSession
+    if (-not $session) {
+        return
+    }
+
+    Write-SyncLog -LogPath $script:Config.LogPath -Level "WARN" -Message "qBittorrent is disconnected on listen_port=$port; checking for a Windows port reservation and rebinding."
+    $script:BindRepairCount++
+    $script:LastBindRepairAt = Get-Date
+    try {
+        $result = Invoke-BindPort -Session $session -Port ([int]$port) -Reason "qBittorrent disconnected"
+        Update-WatcherStatus -State $(if ($result.Success) { "running" } else { "port-blocked" }) -HeartbeatOnly
+    }
+    catch {
+        $script:QbtSession = $null
+        $script:BindFailedPort = "$port"
+        $script:BindFailedAt = Get-Date
+        Write-SyncLog -LogPath $script:Config.LogPath -Level "WARN" -Message "Rebinding listen_port=$port failed: $($_.Exception.Message)"
+    }
+}
+
+function Update-ProtonPortStatus {
+    $script:LastPortStatus = Get-ProtonForwardPortStatus `
+        -LogPath $script:Config.ProtonVpnLogPath `
+        -StaleSeconds $script:Config.ProtonPortStaleSeconds
+
+    if ($script:LastPortStatus.State -eq "active") {
+        $script:StalePortSinceAt = $null
+        $port = $script:LastPortStatus.Port
+        if ($script:PendingPort -ne $port -and $script:LastAppliedPort -ne $port) {
+            Invoke-ApplyPort -Port $port
+            if ($script:PendingPort) {
+                $script:LastRetryAt = Get-Date
+            }
+        }
+        return
+    }
+
+    # Only treat a stale port as a death signal once we've actually applied a port before;
+    # missing-log / no-port at startup is the normal "waiting" state, not a failure.
+    if ($script:LastPortStatus.State -eq "stale-port" -and $script:LastAppliedPort) {
+        if (-not $script:StalePortSinceAt) {
+            $script:StalePortSinceAt = Get-Date
+        }
+    }
+    else {
+        $script:StalePortSinceAt = $null
+    }
+
+    Write-SyncLogOnce -Key "LastLoggedPortMessage" -Message $script:LastPortStatus.Message
+}
+
 function Update-QbtLiveness {
     # Track qBittorrent's own view of inbound reachability. Only meaningful once we've pushed a port.
     if (-not $script:LastAppliedPort) {
         $script:FirewalledSinceAt = $null
+        $script:DisconnectedSinceAt = $null
         return
     }
 
@@ -140,7 +344,11 @@ function Update-QbtLiveness {
 
     try {
         $script:ConnectionStatus = Get-QbtConnectionStatus -QbtUrl $script:Config.QbtUrl -Session $session
-        $script:ActiveTorrents = Get-QbtActiveTorrentCount -QbtUrl $script:Config.QbtUrl -Session $session
+        # The torrent count only matters for the firewalled check, so skip that request otherwise.
+        $script:ActiveTorrents = $null
+        if ($script:ConnectionStatus -eq "firewalled") {
+            $script:ActiveTorrents = Get-QbtActiveTorrentCount -QbtUrl $script:Config.QbtUrl -Session $session
+        }
         $script:LastLoggedQbtError = $null
     }
     catch {
@@ -161,6 +369,25 @@ function Update-QbtLiveness {
     }
     else {
         $script:FirewalledSinceAt = $null
+    }
+
+    # "disconnected" means qBittorrent has no listener at all, e.g. after its bind was refused.
+    if ($script:ConnectionStatus -eq "disconnected") {
+        # Confirm for a few seconds first: qBittorrent reports disconnected briefly while it starts or rebinds.
+        $confirmSeconds = 5
+        if (-not $script:DisconnectedSinceAt) {
+            $script:DisconnectedSinceAt = Get-Date
+        }
+        $elapsed = ((Get-Date) - $script:DisconnectedSinceAt).TotalSeconds
+        if ($elapsed -ge $confirmSeconds) {
+            Invoke-BindRepair
+        }
+        else {
+            Request-LivenessCheck -InSeconds ([int][math]::Ceiling($confirmSeconds - $elapsed))
+        }
+    }
+    else {
+        $script:DisconnectedSinceAt = $null
     }
 }
 
@@ -203,58 +430,56 @@ try {
     $script:Config = Get-SyncConfig -ScriptRoot $PSScriptRoot
     $script:WatcherStartedAt = Get-Date
 
-    Write-SyncLog -LogPath $script:Config.LogPath -Message "Watcher starting. AutoReconnect=$($script:Config.AutoReconnect)."
-    if ($script:Config.AutoReconnect -and -not (Test-IsElevated)) {
-        Write-SyncLog -LogPath $script:Config.LogPath -Level "WARN" -Message "AutoReconnect is on but this process is not elevated; Proton service restarts will be skipped. Re-run install-task.ps1 so the task runs with highest privileges."
+    Write-SyncLog -LogPath $script:Config.LogPath -Message "Watcher starting. AutoReconnect=$($script:Config.AutoReconnect) WinnatAutoRestart=$($script:Config.WinnatAutoRestart)."
+    if (($script:Config.AutoReconnect -or $script:Config.WinnatAutoRestart) -and -not (Test-IsElevated)) {
+        Write-SyncLog -LogPath $script:Config.LogPath -Level "WARN" -Message "This process is not elevated, so Proton service restarts and winnat restarts will be skipped. Re-run install-task.ps1 so the task runs with highest privileges."
     }
     Update-WatcherStatus -State "starting"
 
-    $lastRetryAt = (Get-Date).AddSeconds(-$QbtRetryDelaySeconds)
-    $lastHeartbeatAt = (Get-Date).AddSeconds(-$script:Config.HeartbeatIntervalSeconds)
+    $script:LastRetryAt = (Get-Date).AddSeconds(-$QbtRetryDelaySeconds)
+    $script:NextLivenessAt = Get-Date
+    $nextLogReadAt = Get-Date
+    $nextHeartbeatAt = Get-Date
 
     while ($true) {
-        # A transient failure in one poll (Proton rotating its log mid-read, a locked status file,
+        # A transient failure in one pass (Proton rotating its log mid-read, a locked status file,
         # etc.) must not end the watcher: Task Scheduler does not restart a task whose script exits
-        # with an error, so it would stay down until the next logon. Log it and retry next poll.
+        # with an error, so it would stay down until the next logon. Log it and retry shortly.
         try {
-            $script:LastPortStatus = Get-ProtonForwardPortStatus `
-                -LogPath $script:Config.ProtonVpnLogPath `
-                -StaleSeconds $script:Config.ProtonPortStaleSeconds
-
-            if ($script:LastPortStatus.State -eq "active") {
-                $script:StalePortSinceAt = $null
-                $port = $script:LastPortStatus.Port
-                if ($script:PendingPort -ne $port -and $script:LastAppliedPort -ne $port) {
-                    Invoke-ApplyPort -Port $port
-                    if ($script:PendingPort) {
-                        $lastRetryAt = Get-Date
-                    }
-                }
-            }
-            else {
-                # Only treat a stale port as a death signal once we've actually applied a port before;
-                # missing-log / no-port at startup is the normal "waiting" state, not a failure.
-                if ($script:LastPortStatus.State -eq "stale-port" -and $script:LastAppliedPort) {
-                    if (-not $script:StalePortSinceAt) {
-                        $script:StalePortSinceAt = Get-Date
-                    }
-                }
-                else {
-                    $script:StalePortSinceAt = $null
-                }
-
-                if ($script:LastLoggedPortMessage -ne $script:LastPortStatus.Message) {
-                    Write-SyncLog -LogPath $script:Config.LogPath -Level "INFO" -Message $script:LastPortStatus.Message
-                    $script:LastLoggedPortMessage = $script:LastPortStatus.Message
-                }
+            if (-not $script:ProtonLogWatcher) {
+                Start-ProtonLogWatcher
             }
 
-            if ($script:PendingPort -and ((Get-Date) - $lastRetryAt).TotalSeconds -ge $QbtRetryDelaySeconds) {
+            # Sleep until the next scheduled job, waking early when Windows reports a Proton log write.
+            $dueTimes = @($nextLogReadAt, $script:NextLivenessAt, $nextHeartbeatAt)
+            if ($script:PendingPort) {
+                $dueTimes += $script:LastRetryAt.AddSeconds($QbtRetryDelaySeconds)
+            }
+            $nextDueAt = $dueTimes | Sort-Object | Select-Object -First 1
+            $waitSeconds = ($nextDueAt - (Get-Date)).TotalSeconds
+
+            $logChanged = $false
+            if ($script:ProtonLogWatcher) {
+                $logChanged = Wait-FileChange -SourceIdentifier $script:LogEventSource -TimeoutSeconds $waitSeconds
+            }
+            elseif ($waitSeconds -gt 0) {
+                Start-Sleep -Milliseconds ([int][math]::Ceiling($waitSeconds * 1000))
+            }
+
+            if ($logChanged -or (Get-Date) -ge $nextLogReadAt) {
+                Update-ProtonPortStatus
+                $nextLogReadAt = (Get-Date).AddSeconds($script:Config.PollIntervalSeconds)
+            }
+
+            if ($script:PendingPort -and ((Get-Date) - $script:LastRetryAt).TotalSeconds -ge $QbtRetryDelaySeconds) {
                 Invoke-ApplyPort -Port $script:PendingPort
-                $lastRetryAt = Get-Date
+                $script:LastRetryAt = Get-Date
             }
 
-            Update-QbtLiveness
+            if ((Get-Date) -ge $script:NextLivenessAt) {
+                $script:NextLivenessAt = (Get-Date).AddSeconds($script:Config.QbtPollIntervalSeconds)
+                Update-QbtLiveness
+            }
 
             if ($script:Config.AutoReconnect) {
                 $reason = Get-ReconnectReason
@@ -266,10 +491,10 @@ try {
                 }
             }
 
-            if (((Get-Date) - $lastHeartbeatAt).TotalSeconds -ge $script:Config.HeartbeatIntervalSeconds) {
-                $heartbeatState = if ($script:PendingPort) { "degraded" } elseif ($script:LastPortStatus.State -eq "active") { "running" } else { "waiting-for-proton-port" }
+            if ((Get-Date) -ge $nextHeartbeatAt) {
+                $heartbeatState = if ($script:PendingPort) { "degraded" } elseif ($script:BindFailedPort) { "port-blocked" } elseif ($script:LastPortStatus -and $script:LastPortStatus.State -eq "active") { "running" } else { "waiting-for-proton-port" }
                 Update-WatcherStatus -State $heartbeatState -HeartbeatOnly
-                $lastHeartbeatAt = Get-Date
+                $nextHeartbeatAt = (Get-Date).AddSeconds($script:Config.HeartbeatIntervalSeconds)
             }
 
             $script:LastLoggedLoopError = $null
@@ -278,16 +503,16 @@ try {
             $loopError = $_.Exception.Message
             if ($script:LastLoggedLoopError -ne $loopError) {
                 try {
-                    Write-SyncLog -LogPath $script:Config.LogPath -Level "WARN" -Message "Poll failed; retrying next interval: $loopError"
+                    Write-SyncLog -LogPath $script:Config.LogPath -Level "WARN" -Message "Watcher pass failed; retrying shortly: $loopError"
                 }
                 catch {
-                    # Logging itself failed (for example, the log file is locked); keep polling.
+                    # Logging itself failed (for example, the log file is locked); keep going.
                 }
                 $script:LastLoggedLoopError = $loopError
             }
+            # The failed pass may have skipped its sleep; back off so a persistent error cannot spin.
+            Start-Sleep -Seconds 5
         }
-
-        Start-Sleep -Seconds $script:Config.PollIntervalSeconds
     }
 }
 catch {
@@ -305,7 +530,7 @@ catch {
         Write-SyncStatus -StatusPath $statusPath -Status @{
             state = "terminated"
             watcherPid = $PID
-            watcherStartedAt = $(if ($script:WatcherStartedAt) { $script:WatcherStartedAt.ToString("o") } else { $null })
+            watcherStartedAt = Format-StatusTime $script:WatcherStartedAt
             updatedAt = (Get-Date).ToString("o")
             lastHeartbeatAt = (Get-Date).ToString("o")
             lastAppliedPort = $script:LastAppliedPort
@@ -313,10 +538,14 @@ catch {
             protonPortState = $(if ($script:LastPortStatus) { $script:LastPortStatus.State } else { $null })
             connectionStatus = $script:ConnectionStatus
             reconnectCount = $script:ReconnectCount
+            winnatRestartCount = $script:WinnatRestartCount
             protonVpnLogPath = $(if ($script:Config) { $script:Config.ProtonVpnLogPath } else { $null })
             logPath = $logPath
             error = $_.Exception.Message
         }
     }
     exit 1
+}
+finally {
+    Stop-ProtonLogWatcher
 }
