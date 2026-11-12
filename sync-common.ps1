@@ -77,27 +77,41 @@ function Get-SyncConfig {
     $defaultStatusPath = Join-Path $env:LocalAppData "sync-ports\watch-status.json"
     $statusPath = Resolve-ConfigValue -Name "SYNC_STATUS_PATH" -Default $defaultStatusPath
 
+    function Resolve-BoolValue {
+        param(
+            [string]$Name,
+            [bool]$Default
+        )
+
+        $raw = Resolve-ConfigValue -Name $Name -Default $(if ($Default) { "true" } else { "false" })
+        switch -Regex ($raw.Trim()) {
+            "^(1|true|yes|on)$" { return $true }
+            "^(0|false|no|off)$" { return $false }
+        }
+        throw "$Name must be true or false."
+    }
+
     $heartbeatIntervalSeconds = Resolve-IntValue -Name "SYNC_HEARTBEAT_SECONDS" -Default 300 -Minimum 5
-    $pollIntervalSeconds = Resolve-IntValue -Name "SYNC_POLL_SECONDS" -Default 10 -Minimum 1
+    # Fallback re-read of the Proton log, which also re-evaluates port staleness. File-change events
+    # trigger a read whenever Proton writes.
+    $pollIntervalSeconds = Resolve-IntValue -Name "SYNC_POLL_SECONDS" -Default 30 -Minimum 1
+    $qbtPollIntervalSeconds = Resolve-IntValue -Name "QBT_POLL_SECONDS" -Default 15 -Minimum 5
     $protonPortStaleSeconds = Resolve-IntValue -Name "PROTON_PORT_STALE_SECONDS" -Default 180 -Minimum 1
     $firewallGraceSeconds = Resolve-IntValue -Name "QBT_FIREWALL_GRACE_SECONDS" -Default 180 -Minimum 10
     $reconnectCooldownSeconds = Resolve-IntValue -Name "RECONNECT_COOLDOWN_SECONDS" -Default 300 -Minimum 30
+    $bindRetryCooldownSeconds = Resolve-IntValue -Name "BIND_RETRY_COOLDOWN_SECONDS" -Default 600 -Minimum 60
 
-    $qbtDisableUpnpRaw = Resolve-ConfigValue -Name "QBT_DISABLE_UPNP" -Default "true"
-    $autoReconnectRaw = Resolve-ConfigValue -Name "PROTON_AUTO_RECONNECT" -Default "true"
+    $qbtDisableUpnp = Resolve-BoolValue -Name "QBT_DISABLE_UPNP" -Default $true
+    $autoReconnect = Resolve-BoolValue -Name "PROTON_AUTO_RECONNECT" -Default $true
+    $winnatAutoRestart = Resolve-BoolValue -Name "WINNAT_AUTO_RESTART" -Default $true
 
-    $qbtDisableUpnp = $true
-    switch -Regex ($qbtDisableUpnpRaw.Trim()) {
-        "^(1|true|yes|on)$" { $qbtDisableUpnp = $true; break }
-        "^(0|false|no|off)$" { $qbtDisableUpnp = $false; break }
-        default { throw "QBT_DISABLE_UPNP must be true or false." }
-    }
-
-    $autoReconnect = $true
-    switch -Regex ($autoReconnectRaw.Trim()) {
-        "^(1|true|yes|on)$" { $autoReconnect = $true; break }
-        "^(0|false|no|off)$" { $autoReconnect = $false; break }
-        default { throw "PROTON_AUTO_RECONNECT must be true or false." }
+    $qbtBindAddress = ([string](Resolve-ConfigValue -Name "QBT_BIND_ADDRESS" -Default "")).Trim()
+    if ($qbtBindAddress) {
+        $parsedAddress = $null
+        if (-not [System.Net.IPAddress]::TryParse($qbtBindAddress, [ref]$parsedAddress) -or
+            $parsedAddress.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) {
+            throw "QBT_BIND_ADDRESS must be an IPv4 address."
+        }
     }
 
     $protonServiceNames = @($protonServiceNamesRaw -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ })
@@ -120,11 +134,15 @@ function Get-SyncConfig {
         StatusPath = $statusPath
         HeartbeatIntervalSeconds = $heartbeatIntervalSeconds
         PollIntervalSeconds = $pollIntervalSeconds
+        QbtPollIntervalSeconds = $qbtPollIntervalSeconds
         ProtonPortStaleSeconds = $protonPortStaleSeconds
         FirewallGraceSeconds = $firewallGraceSeconds
         ReconnectCooldownSeconds = $reconnectCooldownSeconds
+        BindRetryCooldownSeconds = $bindRetryCooldownSeconds
         QbtDisableUpnp = $qbtDisableUpnp
         AutoReconnect = $autoReconnect
+        WinnatAutoRestart = $winnatAutoRestart
+        QbtBindAddress = $qbtBindAddress
     }
 }
 
@@ -376,6 +394,298 @@ function Restart-ProtonConnection {
     return ($restarted -gt 0)
 }
 
+function ConvertFrom-ExcludedPortRangeText {
+    # Parses `netsh interface ipv4 show excludedportrange` output. Rows are "<start> <end>", with a
+    # trailing "*" on administered (persistent) exclusions; headers are localized, so match rows only.
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string[]]$Lines
+    )
+
+    $ranges = @()
+    foreach ($line in @($Lines)) {
+        $match = [regex]::Match("$line", "^\s*(\d+)\s+(\d+)\s*(\*)?\s*$")
+        if ($match.Success) {
+            $ranges += [pscustomobject]@{
+                Start = [int]$match.Groups[1].Value
+                End = [int]$match.Groups[2].Value
+                Administered = $match.Groups[3].Success
+            }
+        }
+    }
+    return $ranges
+}
+
+function Get-ExcludedPortRanges {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("udp", "tcp")]
+        [string]$Protocol
+    )
+
+    # Keep native stderr from becoming a terminating error under Windows PowerShell 5.1.
+    $ErrorActionPreference = "Continue"
+    $output = @(& netsh.exe interface ipv4 show excludedportrange "protocol=$Protocol" 2>&1 | ForEach-Object { "$_" })
+    if ($LASTEXITCODE -ne 0) {
+        throw "netsh could not list excluded $Protocol port ranges (exit $LASTEXITCODE): $($output -join ' ')"
+    }
+    return @(ConvertFrom-ExcludedPortRangeText -Lines $output)
+}
+
+function Test-PortBind {
+    # Tries a throwaway bind. Returns "Ok", or the socket error name: AccessDenied (WSAEACCES, the port is
+    # reserved), AddressAlreadyInUse (something holds it), AddressNotAvailable (the adapter has no such IP).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Address,
+        [Parameter(Mandatory = $true)]
+        [int]$Port,
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("udp", "tcp")]
+        [string]$Protocol
+    )
+
+    $socketType = if ($Protocol -eq "udp") { [System.Net.Sockets.SocketType]::Dgram } else { [System.Net.Sockets.SocketType]::Stream }
+    $protocolType = if ($Protocol -eq "udp") { [System.Net.Sockets.ProtocolType]::Udp } else { [System.Net.Sockets.ProtocolType]::Tcp }
+    $socket = New-Object System.Net.Sockets.Socket -ArgumentList ([System.Net.Sockets.AddressFamily]::InterNetwork), $socketType, $protocolType
+    try {
+        $socket.Bind((New-Object System.Net.IPEndPoint -ArgumentList ([System.Net.IPAddress]::Parse($Address)), $Port))
+        return "Ok"
+    }
+    catch {
+        $exception = $_.Exception
+        while ($exception -and -not ($exception -is [System.Net.Sockets.SocketException])) {
+            $exception = $exception.InnerException
+        }
+        if ($exception) {
+            return [string]$exception.SocketErrorCode
+        }
+        return "Error: $($_.Exception.Message)"
+    }
+    finally {
+        $socket.Dispose()
+    }
+}
+
+function Get-PortCollision {
+    # Checks whether Windows will refuse to bind the port, as happens when Hyper-V/WSL's NAT driver (winnat)
+    # reserves a block of the dynamic range that contains it. qBittorrent then drops its whole listener.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$Port,
+        # Address qBittorrent binds to; when empty, the independent test bind is skipped.
+        [string]$BindAddress
+    )
+
+    $reasons = @()
+    $winnatRange = $false
+    $administeredRange = $false
+
+    foreach ($protocol in @("udp", "tcp")) {
+        try {
+            $ranges = @(Get-ExcludedPortRanges -Protocol $protocol)
+        }
+        catch {
+            $reasons += "could not list excluded $protocol ranges: $($_.Exception.Message)"
+            continue
+        }
+        foreach ($range in $ranges) {
+            if ($Port -ge $range.Start -and $Port -le $range.End) {
+                $label = "$($protocol.ToUpper()) $($range.Start)-$($range.End)"
+                if ($range.Administered) {
+                    $administeredRange = $true
+                    $reasons += "$label (administered exclusion)"
+                }
+                else {
+                    $winnatRange = $true
+                    $reasons += "$label reserved"
+                }
+            }
+        }
+    }
+
+    $bindResults = @{ udp = $null; tcp = $null }
+    $bindRefused = $false
+    if (-not [string]::IsNullOrWhiteSpace($BindAddress)) {
+        foreach ($protocol in @("udp", "tcp")) {
+            $bindResults[$protocol] = Test-PortBind -Address $BindAddress -Port $Port -Protocol $protocol
+            if ($bindResults[$protocol] -eq "AccessDenied") {
+                $bindRefused = $true
+                $reasons += "test $($protocol.ToUpper()) bind on ${BindAddress}:$Port refused (WSAEACCES)"
+            }
+        }
+    }
+
+    $blocked = $winnatRange -or $administeredRange -or $bindRefused
+    return [pscustomobject]@{
+        Port = $Port
+        Blocked = $blocked
+        # Restarting winnat releases its own reservations, not administered exclusions.
+        Fixable = $winnatRange -or ($bindRefused -and -not $administeredRange)
+        Reasons = $reasons
+        UdpBind = $bindResults.udp
+        TcpBind = $bindResults.tcp
+    }
+}
+
+function Get-WinnatState {
+    $driver = Get-CimInstance -ClassName Win32_SystemDriver -Filter "Name='winnat'" -ErrorAction SilentlyContinue
+    if (-not $driver) {
+        return $null
+    }
+    return [string]$driver.State
+}
+
+function Invoke-NetServiceCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("start", "stop")]
+        [string]$Verb,
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    $ErrorActionPreference = "Continue"
+    $output = @(& net.exe $Verb $Name 2>&1 | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+    return [pscustomobject]@{
+        ExitCode = $LASTEXITCODE
+        Output = ($output -join " ")
+    }
+}
+
+function Restart-Winnat {
+    # Stops and starts the Windows NAT driver, which releases the port blocks it reserved for Hyper-V/WSL/Docker.
+    # Returns $true once the reservations were released. WSL/Docker NAT networking drops while it restarts.
+    [CmdletBinding()]
+    param(
+        [string]$LogPath
+    )
+
+    if (-not (Test-IsElevated)) {
+        Write-SyncLog -LogPath $LogPath -Level "WARN" -Message "Cannot restart winnat without elevation, so the reserved port stays blocked. Re-run install-task.ps1 so the scheduled task runs with highest privileges."
+        return $false
+    }
+
+    $state = Get-WinnatState
+    if (-not $state) {
+        Write-SyncLog -LogPath $LogPath -Level "WARN" -Message "The winnat driver is not installed, so restarting it cannot release this reservation."
+        return $false
+    }
+    if ($state -ne "Running") {
+        Write-SyncLog -LogPath $LogPath -Level "WARN" -Message "winnat is '$state', so the reservation is not from winnat; it was not restarted."
+        return $false
+    }
+
+    Write-SyncLog -LogPath $LogPath -Level "WARN" -Message "Restarting winnat to release its port reservations; WSL/Docker NAT networking drops briefly."
+    $stop = Invoke-NetServiceCommand -Verb stop -Name "winnat"
+    # Start it again even if stopping failed: leaving winnat stopped breaks WSL/Docker networking.
+    $start = Invoke-NetServiceCommand -Verb start -Name "winnat"
+    if ($start.ExitCode -ne 0 -and (Get-WinnatState) -ne "Running") {
+        Start-Sleep -Seconds 1
+        $start = Invoke-NetServiceCommand -Verb start -Name "winnat"
+    }
+
+    if ($start.ExitCode -ne 0 -and (Get-WinnatState) -ne "Running") {
+        Write-SyncLog -LogPath $LogPath -Level "ERROR" -Message "winnat did not start again (net start exit $($start.ExitCode): $($start.Output)). WSL/Docker networking stays down until 'net start winnat' is run as administrator."
+    }
+    if ($stop.ExitCode -ne 0) {
+        Write-SyncLog -LogPath $LogPath -Level "WARN" -Message "net stop winnat failed (exit $($stop.ExitCode): $($stop.Output))."
+        return $false
+    }
+    return $true
+}
+
+function Start-FileChangeWatcher {
+    # Raises PowerShell events "<SourceIdentifier>.<event>" when the file is written, created or renamed.
+    # Returns $null when the folder does not exist yet. Windows sends these notifications once the write
+    # cache reaches disk, which was measured at 5-8 s after each Proton log write.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [Parameter(Mandatory = $true)]
+        [string]$SourceIdentifier
+    )
+
+    $directory = Split-Path -Path $Path -Parent
+    $fileName = Split-Path -Path $Path -Leaf
+    if (-not $directory -or -not (Test-Path -LiteralPath $directory -PathType Container)) {
+        return $null
+    }
+
+    $watcher = New-Object System.IO.FileSystemWatcher -ArgumentList $directory, $fileName
+    try {
+        $watcher.NotifyFilter = [System.IO.NotifyFilters]::LastWrite -bor [System.IO.NotifyFilters]::Size -bor [System.IO.NotifyFilters]::FileName
+        foreach ($eventName in @("Changed", "Created", "Renamed", "Error")) {
+            Register-ObjectEvent -InputObject $watcher -EventName $eventName -SourceIdentifier "$SourceIdentifier.$eventName" | Out-Null
+        }
+        $watcher.EnableRaisingEvents = $true
+        return $watcher
+    }
+    catch {
+        Stop-FileChangeWatcher -Watcher $watcher -SourceIdentifier $SourceIdentifier
+        throw
+    }
+}
+
+function Stop-FileChangeWatcher {
+    param(
+        $Watcher,
+        [Parameter(Mandatory = $true)]
+        [string]$SourceIdentifier
+    )
+
+    Get-EventSubscriber -ErrorAction SilentlyContinue |
+        Where-Object { $_.SourceIdentifier -like "$SourceIdentifier.*" } |
+        ForEach-Object { Unregister-Event -SubscriptionId $_.SubscriptionId -ErrorAction SilentlyContinue }
+    Get-Event -ErrorAction SilentlyContinue |
+        Where-Object { $_.SourceIdentifier -like "$SourceIdentifier.*" } |
+        Remove-Event -ErrorAction SilentlyContinue
+    if ($Watcher) {
+        $Watcher.EnableRaisingEvents = $false
+        $Watcher.Dispose()
+    }
+}
+
+function Wait-FileChange {
+    # Blocks until a Start-FileChangeWatcher event arrives or the timeout passes. Returns $true on a change.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SourceIdentifier,
+        [double]$TimeoutSeconds = 0,
+        # Pause after the first event so a burst of writes is handled by one read.
+        [int]$SettleMilliseconds = 200
+    )
+
+    $pattern = "$SourceIdentifier.*"
+    $deadline = (Get-Date).AddSeconds([math]::Max(0, $TimeoutSeconds))
+    while (-not @(Get-Event -ErrorAction SilentlyContinue | Where-Object { $_.SourceIdentifier -like $pattern }).Count) {
+        $remaining = ($deadline - (Get-Date)).TotalSeconds
+        if ($remaining -le 0) {
+            return $false
+        }
+        $nextEvent = Wait-Event -Timeout ([int][math]::Ceiling($remaining))
+        if (-not $nextEvent) {
+            return $false
+        }
+        if ($nextEvent.SourceIdentifier -notlike $pattern) {
+            # Not ours; drop it so it cannot wake this loop again.
+            $nextEvent | Remove-Event -ErrorAction SilentlyContinue
+        }
+    }
+
+    if ($SettleMilliseconds -gt 0) {
+        Start-Sleep -Milliseconds $SettleMilliseconds
+    }
+    Get-Event -ErrorAction SilentlyContinue | Where-Object { $_.SourceIdentifier -like $pattern } | Remove-Event -ErrorAction SilentlyContinue
+    return $true
+}
+
 function Get-QbtWebRequestParams {
     $webRequestParams = @{}
     if ((Get-Command Invoke-WebRequest).Parameters.ContainsKey("UseBasicParsing")) {
@@ -420,6 +730,62 @@ function Connect-Qbt {
     return $session
 }
 
+function Get-QbtPreferences {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$QbtUrl,
+        [Parameter(Mandatory = $true)]
+        $Session
+    )
+
+    $webRequestParams = Get-QbtWebRequestParams
+
+    $response = Invoke-WebRequest `
+        -Uri "$QbtUrl/api/v2/app/preferences" `
+        -Method GET `
+        -Headers @{ Referer = $QbtUrl } `
+        -WebSession $Session `
+        @webRequestParams
+
+    return ("$($response.Content)" | ConvertFrom-Json)
+}
+
+function Send-QbtPreferences {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$QbtUrl,
+        [Parameter(Mandatory = $true)]
+        $Session,
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Preferences
+    )
+
+    $webRequestParams = Get-QbtWebRequestParams
+    $prefsJson = $Preferences | ConvertTo-Json -Compress
+
+    Invoke-WebRequest `
+        -Uri "$QbtUrl/api/v2/app/setPreferences" `
+        -Method POST `
+        -Headers @{ Referer = $QbtUrl } `
+        -WebSession $Session `
+        -Body @{ json = $prefsJson } `
+        @webRequestParams | Out-Null
+}
+
+function Get-TemporaryListenPort {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$Port
+    )
+
+    if ($Port -lt 65535) {
+        return $Port + 1
+    }
+    return $Port - 1
+}
+
 function Set-QbtListenPort {
     [CmdletBinding()]
     param(
@@ -430,29 +796,35 @@ function Set-QbtListenPort {
         [bool]$DisableUpnp = $true,
         [string]$QbtUser,
         [string]$QbtPass,
-        $Session
+        $Session,
+        # qBittorrent ignores a listen_port equal to its current one, so it never retries a listener that
+        # failed to open. -ForceRebind switches to a neighbouring port first so the real port is a change.
+        [switch]$ForceRebind,
+        # qBittorrent's current listen_port, if already known; otherwise -ForceRebind reads it.
+        [int]$CurrentPort = -1
     )
 
     if (-not $Session) {
         $Session = Connect-Qbt -QbtUrl $QbtUrl -QbtUser $QbtUser -QbtPass $QbtPass
     }
 
-    $webRequestParams = Get-QbtWebRequestParams
+    if ($ForceRebind) {
+        if ($CurrentPort -lt 0) {
+            $CurrentPort = [int](Get-QbtPreferences -QbtUrl $QbtUrl -Session $Session).listen_port
+        }
+        if ($CurrentPort -eq $Port) {
+            Send-QbtPreferences -QbtUrl $QbtUrl -Session $Session -Preferences @{ listen_port = (Get-TemporaryListenPort -Port $Port) }
+            # Let qBittorrent apply the temporary port first, or it can merge both changes into no change.
+            Start-Sleep -Milliseconds 500
+        }
+    }
 
     $prefs = @{ listen_port = $Port }
     if ($DisableUpnp) {
         $prefs.upnp = $false
     }
 
-    $prefsJson = $prefs | ConvertTo-Json -Compress
-
-    Invoke-WebRequest `
-        -Uri "$QbtUrl/api/v2/app/setPreferences" `
-        -Method POST `
-        -Headers @{ Referer = $QbtUrl } `
-        -WebSession $Session `
-        -Body @{ json = $prefsJson } `
-        @webRequestParams | Out-Null
+    Send-QbtPreferences -QbtUrl $QbtUrl -Session $Session -Preferences $prefs
 }
 
 function Get-QbtConnectionStatus {
@@ -499,4 +871,174 @@ function Get-QbtActiveTorrentCount {
     # @($null).Count would wrongly report 1; Where-Object drops the null.
     $torrents = @("$($response.Content)" | ConvertFrom-Json | Where-Object { $_ })
     return $torrents.Count
+}
+
+function Wait-QbtListening {
+    # Polls until qBittorrent reports a listener (connected or firewalled) or the timeout passes.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$QbtUrl,
+        [Parameter(Mandatory = $true)]
+        $Session,
+        [int]$TimeoutSeconds = 15
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    # Give qBittorrent a moment to drop the old listener so a stale "firewalled" isn't read as success.
+    Start-Sleep -Milliseconds 1500
+    while ($true) {
+        $status = Get-QbtConnectionStatus -QbtUrl $QbtUrl -Session $Session
+        if ($status -in @("connected", "firewalled") -or (Get-Date) -ge $deadline) {
+            return $status
+        }
+        Start-Sleep -Seconds 1
+    }
+}
+
+function Resolve-QbtBindAddress {
+    # The IPv4 address qBittorrent listens on: QBT_BIND_ADDRESS, else qBittorrent's bound address, else the
+    # address of its bound adapter (e.g. ProtonVPN), else 0.0.0.0 when it listens on every interface.
+    # Returns $null when it is bound to an adapter without an IPv4 address (VPN down).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        $Config,
+        $Preferences
+    )
+
+    if ($Config.QbtBindAddress) {
+        return $Config.QbtBindAddress
+    }
+    if (-not $Preferences) {
+        return $null
+    }
+
+    $names = @($Preferences.PSObject.Properties.Name)
+    if ($names -contains "current_interface_address") {
+        $address = "$($Preferences.current_interface_address)".Trim()
+        $parsed = $null
+        if ($address -and [System.Net.IPAddress]::TryParse($address, [ref]$parsed) -and
+            $parsed.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
+            return $address
+        }
+    }
+
+    if ($names -contains "current_interface_name") {
+        $alias = "$($Preferences.current_interface_name)".Trim()
+        if ($alias) {
+            $ip = $null
+            try {
+                $ip = Get-NetIPAddress -InterfaceAlias $alias -AddressFamily IPv4 -ErrorAction Stop | Select-Object -First 1
+            }
+            catch {
+                $ip = $null
+            }
+            if ($ip) {
+                return [string]$ip.IPAddress
+            }
+            return $null
+        }
+    }
+
+    if (($names -contains "current_network_interface") -and "$($Preferences.current_network_interface)".Trim()) {
+        return $null
+    }
+    return "0.0.0.0"
+}
+
+function Invoke-QbtPortBind {
+    # Gives qBittorrent the port and makes sure it can actually listen on it:
+    #   1. detect a Windows port reservation (netsh excluded ranges, plus a test bind),
+    #   2. release it by restarting winnat (only on a real collision),
+    #   3. push the port right away, forcing a rebind even if it is unchanged,
+    #   4. verify qBittorrent is connected/firewalled; otherwise repeat once.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        $Config,
+        [Parameter(Mandatory = $true)]
+        $Session,
+        [Parameter(Mandatory = $true)]
+        [int]$Port,
+        [string]$Reason = "port update",
+        # qBittorrent preferences, if already fetched.
+        $Preferences,
+        # Do nothing if qBittorrent already listens on this port.
+        [switch]$SkipIfListening,
+        [int]$MaxAttempts = 2,
+        [int]$VerifyTimeoutSeconds = 15
+    )
+
+    $logPath = $Config.LogPath
+    if (-not $Preferences) {
+        $Preferences = Get-QbtPreferences -QbtUrl $Config.QbtUrl -Session $Session
+    }
+    $qbtPort = [int]$Preferences.listen_port
+
+    $result = [pscustomobject]@{
+        Port = $Port
+        Success = $false
+        ConnectionStatus = $null
+        Attempts = 0
+        WinnatRestarts = 0
+        Collision = $null
+        BindAddress = (Resolve-QbtBindAddress -Config $Config -Preferences $Preferences)
+    }
+
+    if ($SkipIfListening -and $qbtPort -eq $Port) {
+        $status = Get-QbtConnectionStatus -QbtUrl $Config.QbtUrl -Session $Session
+        if ($status -in @("connected", "firewalled")) {
+            $result.Success = $true
+            $result.ConnectionStatus = $status
+            return $result
+        }
+    }
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        $result.Attempts = $attempt
+
+        # 1. Detect.
+        $collision = Get-PortCollision -Port $Port -BindAddress $result.BindAddress
+        $result.Collision = $collision
+
+        # 2. Release. Restarting winnat briefly drops WSL/Docker NAT networking, so only on a real collision.
+        if ($collision.Blocked) {
+            Write-SyncLog -LogPath $logPath -Level "WARN" -Message "listen_port=$Port is reserved by Windows: $($collision.Reasons -join '; ')."
+            if (-not $collision.Fixable) {
+                Write-SyncLog -LogPath $logPath -Level "ERROR" -Message "Port $Port is in an administered port exclusion, which restarting winnat does not release. Remove it with 'netsh interface ipv4 delete excludedportrange' or reconnect Proton VPN for a new port."
+            }
+            elseif (-not $Config.WinnatAutoRestart) {
+                Write-SyncLog -LogPath $logPath -Level "WARN" -Message "WINNAT_AUTO_RESTART is off, so winnat was not restarted to release port $Port."
+            }
+            else {
+                if ($qbtPort -eq $Port) {
+                    # Move off the port first, so the push right after winnat restarts is a change and takes one request.
+                    $temporaryPort = Get-TemporaryListenPort -Port $Port
+                    Set-QbtListenPort -QbtUrl $Config.QbtUrl -Port $temporaryPort -DisableUpnp $Config.QbtDisableUpnp -Session $Session
+                    $qbtPort = $temporaryPort
+                    Start-Sleep -Milliseconds 500
+                }
+                if (Restart-Winnat -LogPath $logPath) {
+                    $result.WinnatRestarts++
+                }
+            }
+        }
+
+        # 3. Bind immediately. WSL/Docker re-reserve port blocks soon after winnat starts; an open socket survives that.
+        Set-QbtListenPort -QbtUrl $Config.QbtUrl -Port $Port -DisableUpnp $Config.QbtDisableUpnp -Session $Session -ForceRebind -CurrentPort $qbtPort
+        $qbtPort = $Port
+
+        # 4. Verify.
+        $result.ConnectionStatus = Wait-QbtListening -QbtUrl $Config.QbtUrl -Session $Session -TimeoutSeconds $VerifyTimeoutSeconds
+        if ($result.ConnectionStatus -in @("connected", "firewalled")) {
+            $result.Success = $true
+            Write-SyncLog -LogPath $logPath -Message "qBittorrent is listening on port $Port (connection_status=$($result.ConnectionStatus))."
+            return $result
+        }
+        Write-SyncLog -LogPath $logPath -Level "WARN" -Message "qBittorrent is still '$($result.ConnectionStatus)' on port $Port after attempt $attempt of $MaxAttempts."
+    }
+
+    Write-SyncLog -LogPath $logPath -Level "ERROR" -Message "qBittorrent could not listen on port $Port after $MaxAttempts attempts ($Reason). Look for 'Failed to listen' in qBittorrent's log."
+    return $result
 }

@@ -45,7 +45,7 @@ Register-ScheduledTask `
     -Trigger $trigger `
     -Settings $settings `
     -Principal $principal `
-    -Description "Keeps qBittorrent listen port synced with Proton VPN forwarded port via Proton VPN app log parsing, and restarts Proton VPN services to recover a dead forwarded port." `
+    -Description "Keeps qBittorrent listen port synced with Proton VPN forwarded port via Proton VPN app log parsing, restarts winnat when the port is reserved by WSL/Docker NAT, and restarts Proton VPN services to recover a dead forwarded port." `
     -Force | Out-Null
 
 if ($TaskName -ne $LegacyTaskName) {
